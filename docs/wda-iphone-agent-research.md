@@ -230,6 +230,61 @@ Skill 的生命周期：大模型首次完成任务 → 生成候选 Skill → �
 
 ---
 
+## 7. Mac 端 Harness 技术选型建议（2026-10-24 追加）
+
+### 7.1 总体架构：快路径与慢路径分离
+
+```
+用户指令
+  └─ Skill 检索（本地向量 / 关键词匹配 + Haiku 抽取参数）
+       ├─ 命中 → 【快路径】确定性回放引擎 ──→ WDA（HTTP，USB）
+       │             每步做断言，失败则转入慢路径
+       └─ 未命中 → 【慢路径】LLM Agent 循环 ──→ 同一套 iPhone 工具
+                      成功后 → Skill 编译器（子 Agent）→ 生成或修订 Skill
+```
+
+- **快路径必须自己实现，不依赖任何 Agent 框架。** 它就是一个执行 Skill JSON 的状态机，延迟和成本都由我们自己控制。
+- **慢路径可以使用现成的 Agent Harness。**
+
+### 7.2 慢路径框架选型
+
+| 方案 | 适合程度 | 理由 |
+|---|---|---|
+| **Claude Agent SDK**（TS / Python，即 Claude Code 封装成的库） | ⭐ MVP 首选 | 自带 Skills 机制（`SKILL.md` 文件，Agent 可以自己写新 Skill，天然契合「自进化」）；hooks 可以对支付、发送等敏感工具调用做拦截审批；原生支持 MCP；有子 Agent，可以专门承担 Skill 编译和修复；自带会话和上下文管理 |
+| **Messages API + Tool Runner**（`anthropic` SDK 自建循环） | ⭐ 产品化阶段 | 对每一步的控制最细：模型路由（规划用 `claude-opus-5-5`，参数抽取和断言用 `claude-haiku-5-5`）、提示缓存、截图历史裁剪。等体验和成本需要精细优化时，再从 Agent SDK 迁移过来 |
+| **Managed Agents** | ❌ 不适合做主循环 | 循环和沙箱都在 Anthropic 云端，无法直接访问 Mac 上通过 USB 连接的 iPhone，每一步都要多一次往返。可以考虑用于离线的 Skill 巡检和回归（定时任务） |
+| LangGraph / OpenAI Agents SDK 等 | 可选 | 适合需要多家模型混用的场景；没有现成的 Skill 文件机制 |
+
+- **不要直接使用 computer use 工具。** 它面向桌面坐标系，而且 Opus 5.5 只能通过 `computer_toolset_20260801` 使用。iPhone 应该定义一组**自定义工具**：`screenshot`、`ui_tree`、`tap(by=id|text|xy)`、`swipe`、`type_text`、`open_url`、`home`、`app_launch`，并对参数开启 `strict: true`。
+- **把这组工具同时封装成 MCP Server。** 这样内部 Agent 可以使用，也可以直接提供给 Claude Code / Cursor 用户，覆盖「开发者工具」这条商业线。
+
+### 7.3 其余组件
+
+| 层 | 建议 | 说明 |
+|---|---|---|
+| 语言 | **TypeScript（Node）** 作为主进程；外壳用 **Swift** 写菜单栏 App | Agent SDK、MCP、Midscene 生态都以 TS 为主；Swift 负责系统权限、Vision OCR 和开机自启 |
+| WDA 客户端 | 直接调用 WDA 的 HTTP API（轻量封装） | 不建议引入 Appium（太重）；Python 栈可以用 `facebook-wda` |
+| 设备管理 | `xcodebuild test-without-building` / `xcrun devicectl` | 运行在 Mac 上就直接使用苹果官方工具链，比 go-ios / pymobiledevice3 更稳定；需要做好 WDA 保活和自动重启 |
+| 视觉断言 | Apple Vision OCR（端侧，快） | 用于快路径的每步断言 |
+| 本地小模型（可选） | MLX | 离线完成检索和意图匹配，进一步降低成本 |
+| Skill 存储 | 文件（`SKILL.md` + `steps.json`）+ SQLite 记录统计和版本 | 文件格式与 Agent SDK 的 Skills 兼容，便于 Agent 读写 |
+| 安全 | WDA 只监听 USB 转发端口；本地网关使用 token；敏感操作由 hook 拦截，推送到 iPhone 确认 | — |
+
+### 7.4 可参考或可直接复用的开源项目
+
+- **Midscene.js**（字节开源）：已经通过 WDA（≥ 7.0.0）支持 iOS 真机，提供 AI 驱动的操作和断言、HTML 回放报告，以及脚本缓存（缓存在 iOS 上的效果待验证）。可以作为慢路径执行层的候选，也是需要关注的竞品。
+- **iphone-use**：MCP 工具设计和流程回放可以参考。
+- **koprjaa/iphone-agent / phone-harness**：WDA 保活脚本和实时画面查看器可以参考。
+
+### 7.5 结论
+
+- **MVP**：TS 主进程 + Claude Agent SDK 跑慢路径 + 自研快路径回放引擎 + iPhone 工具 MCP Server + Swift 菜单栏外壳。
+- **规模化之后**：慢路径迁移到 Messages API 自建循环，做模型分级路由和提示缓存，进一步压低延迟和成本。
+
+- 参考：[Midscene iOS 集成文档](https://midscenejs.com/integrate-with-ios)、[Midscene iOS 介绍](https://midscenejs.com/ios-introduction)、[Midscene changelog](https://midscenejs.com/changelog)
+
+---
+
 ## 参考来源
 
 - [koprjaa/iphone-agent (GitHub)](https://github.com/koprjaa/iphone-agent)
