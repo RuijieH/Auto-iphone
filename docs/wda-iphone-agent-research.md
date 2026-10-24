@@ -270,15 +270,40 @@ Skill 的生命周期：大模型首次完成任务 → 生成候选 Skill → �
 | Skill 存储 | 文件（`SKILL.md` + `steps.json`）+ SQLite 记录统计和版本 | 文件格式与 Agent SDK 的 Skills 兼容，便于 Agent 读写 |
 | 安全 | WDA 只监听 USB 转发端口；本地网关使用 token；敏感操作由 hook 拦截，推送到 iPhone 确认 | — |
 
-### 7.4 可参考或可直接复用的开源项目
+### 7.4 电脑端任务可视化
+
+目标：用户在 Mac 上能实时看到手机画面、Agent 正在执行的步骤和原因，并能随时暂停、接管或审批。
+
+**界面布局（单窗口，三栏）**
+
+| 区域 | 内容 |
+|---|---|
+| 左：实时手机画面 | 30–60 fps 镜像；叠加 Agent 即将点击的位置（高亮框 / 点击涟漪）、当前定位到的元素框 |
+| 中：任务时间线 | 每步一张卡片：缩略截图、动作（如 tap “发送”）、路径标记（⚡ Skill 回放 / 🧠 LLM 推理）、断言结果 ✅ / ❌、耗时；LLM 步骤展示思考摘要 |
+| 右：控制与状态 | 当前任务和命中的 Skill（版本、历史成功率）；累计耗时和 token 花费；按钮：暂停 / 继续 / 接管（人工直接在画面上点击）/ 终止；敏感操作的审批弹窗 |
+| 附加页 | 历史任务回放（逐步截图 + 动作重放，类似 Midscene 的 HTML 报告）；Skill 库管理（成功率、最近失败、手动编辑 / 停用） |
+
+**实现要点**
+
+- **实时画面**：不要使用 WDA 的 MJPEG（约 10 fps，而且会占用 WDA 资源）。Mac 可以通过 **CoreMediaIO / AVFoundation 直接采集 USB 连接的 iPhone 屏幕**（QuickTime 录屏同样的机制），流畅且延迟低。WDA 截图只用于给模型看和做断言。
+- **事件总线**：Harness 的每个动作都发出结构化事件，例如 `task_started`、`step_planned`、`action_executed`、`screenshot`、`assertion`、`skill_hit`、`approval_required`、`task_done`。
+  - 事件通过 WebSocket 推送给 UI，同时写入 SQLite，供历史回放和 Skill 统计复用。
+- **LLM 推理过程可视化**：开启 `thinking.display: "summarized"`（或 `"updates"`，用于工具调用之间的进度说明），把摘要展示在时间线卡片里，让用户知道「它为什么点这里」。
+- **人工接管**：用户在实时画面上的点击，通过 WDA 转发到手机，并被记录为一次「人工步骤」，可以作为 Skill 修复的示范数据（这也是一个自进化的数据来源）。
+- **UI 技术选型**：
+  - Node 主进程内置 HTTP / WebSocket 服务，前端使用 React Web UI。
+  - 外壳二选一：**Swift 菜单栏 App + WKWebView**（最轻，同时负责屏幕采集、Vision OCR 和系统通知），或 **Electron**（与 Node 主进程同栈，开发最快，但体积大）。MVP 推荐 Electron 先跑通，再根据体验需要换成 Swift 外壳。
+  - 因为 UI 是 Web 实现，同一套界面还可以在局域网内用 iPhone 或 iPad 浏览器打开查看，但必须带鉴权。
+
+### 7.5 可参考或可直接复用的开源项目
 
 - **Midscene.js**（字节开源）：已经通过 WDA（≥ 7.0.0）支持 iOS 真机，提供 AI 驱动的操作和断言、HTML 回放报告，以及脚本缓存（缓存在 iOS 上的效果待验证）。可以作为慢路径执行层的候选，也是需要关注的竞品。
 - **iphone-use**：MCP 工具设计和流程回放可以参考。
 - **koprjaa/iphone-agent / phone-harness**：WDA 保活脚本和实时画面查看器可以参考。
 
-### 7.5 结论
+### 7.6 结论
 
-- **MVP**：TS 主进程 + Claude Agent SDK 跑慢路径 + 自研快路径回放引擎 + iPhone 工具 MCP Server + Swift 菜单栏外壳。
+- **MVP**：TS 主进程 + Claude Agent SDK 跑慢路径 + 自研快路径回放引擎 + iPhone 工具 MCP Server + 任务可视化面板（Electron / React，实时画面通过 CoreMediaIO 采集，事件总线基于 WebSocket + SQLite）。
 - **规模化之后**：慢路径迁移到 Messages API 自建循环，做模型分级路由和提示缓存，进一步压低延迟和成本。
 
 - 参考：[Midscene iOS 集成文档](https://midscenejs.com/integrate-with-ios)、[Midscene iOS 介绍](https://midscenejs.com/ios-introduction)、[Midscene changelog](https://midscenejs.com/changelog)
