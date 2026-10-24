@@ -426,6 +426,39 @@ Skill 的生命周期：大模型首次完成任务 → 生成候选 Skill → �
 
 ---
 
+## 10. 哪个 Harness 最适合「套壳 + 魔改界面」（2026-10-24 追加）
+
+套壳的关键是三点：**内核能否无界面运行（headless）、是否以结构化事件流对外暴露、能否在进程内注入自定义工具**。另外要满足本项目的两个硬约束：支持多家模型（国内市场），以及能完全控制系统提示词（移动端四阶段循环）。
+
+| Harness | 嵌入方式 | 界面魔改自由度 | 多模型 | 许可证 | 评价 |
+|---|---|---|---|---|---|
+| **pi**（pi-mono） | **进程内 SDK**：`createAgentSession()` + `session.subscribe(event)`；也可以用 `pi --mode rpc`（stdin/stdout JSONL） | ⭐⭐⭐⭐⭐ 完全没有界面包袱，事件粒度细（如 `message_update` / `text_delta`） | ✅ `pi-ai` 支持多家模型 | MIT（2026-04 被 Earendil 收购，npm scope 已变为 `@earendil-works`，使用前确认） | **首选**：内核极简，提示词完全可控，iPhone 工具通过 TS 扩展在进程内注入，最适合做成自己的 Electron 或 Web 界面 |
+| **OpenCode** | `opencode serve`：HTTP 服务 + OpenAPI 3.1 自动生成 SDK + SSE 事件流；官方 TUI、桌面端、Web 端都只是它的客户端 | ⭐⭐⭐⭐ 可以 fork 现成的 Web 或桌面客户端，再在此基础上改 | ✅ | MIT | **想要一个现成界面起步时的首选**：客户端和服务端分离最彻底；但内置了较多编程相关的默认设定，需要逐项关闭或替换 |
+| **Goose** | Rust 核心 + 官方桌面端；支持「自定义发行版」（预置模型、扩展和品牌）；MCP 扩展可以在桌面端渲染交互式界面 | ⭐⭐⭐ 换品牌、改配置容易，但深度修改界面和循环需要动 Rust 和桌面端代码 | ✅ | Apache-2.0（Linux 基金会 AAIF 托管） | 适合「快速出一个带品牌的桌面 App」，深度定制成本高 |
+| **Codex app-server** | JSON-RPC 2.0（stdio），官方的 CLI、VS Code 插件、桌面端都基于这套协议 | ⭐⭐⭐⭐ 协议成熟 | ⚠️ 主要面向 OpenAI 模型 | Apache-2.0 | 协议设计值得参考；核心是 Rust，而且偏向 OpenAI 生态 |
+| **Claude Agent SDK** | 进程内 `query()` 返回消息流，界面完全自己写 | ⭐⭐⭐⭐ | ❌ 只支持 Claude | Anthropic 商业条款 | 只做海外市场时可选；Claude Code 本身闭源，**无法修改它的界面** |
+
+### 推荐方案
+
+- **主选 pi SDK + 自研 Electron / React 界面**：
+  - Node 主进程中运行 `AgentSession`，事件经过转换后，与第 7.4 节的事件总线合并：pi 的事件，加上移动运行时层的 `action_executed` / `assertion` / `screenshot`，一起通过 WebSocket 推送到前端，并写入 SQLite。
+  - iPhone 工具、截图上下文管理、等待稳定、审批拦截，都以 pi 扩展的形式在进程内实现。
+  - 默认接国内模型，海外版本切换到 Claude，都通过 `pi-ai` 配置完成，只需维护一套代码。
+- **备选 OpenCode**：如果希望第一周就有一个能用的聊天和会话管理界面，可以 fork 它的 Web 客户端，再加上手机画面和时间线面板。
+- **两者都要注意**：内核是开源社区项目，迭代很快。建议**锁定版本**，并通过一层适配层（自定义的 `AgentEvent` 类型）把内核和界面解耦，以后更换内核时不用改界面。
+
+### 补充参考
+
+- [pi RPC Mode 文档](https://pi.dev/docs/latest/rpc)
+- [pi SDK 文档](https://pidocs.seepine.com/en/sdk)
+- [OpenCode Server 文档](https://www.mintlify.com/anomalyco/opencode/server)
+- [Unlocking the Codex harness（OpenAI）](https://openai.com/index/unlocking-the-codex-harness)
+- [Codex App Server 自定义客户端](https://codex.danielvaughan.com/2026/04/21/codex-app-server-architecture-custom-client-integrations/)
+- [goose docs](https://goose-docs.ai/)
+- [Goose review](https://www.promptquorum.com/power-local-llm/goose-review)
+
+---
+
 ## 参考来源
 
 - [koprjaa/iphone-agent (GitHub)](https://github.com/koprjaa/iphone-agent)
