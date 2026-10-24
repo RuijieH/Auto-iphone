@@ -310,6 +310,84 @@ Skill 的生命周期：大模型首次完成任务 → 生成候选 Skill → �
 
 ---
 
+## 8. 论文调研：Mobile Agent Harness 的特殊性，以及能否复用 Claude Code / pi（2026-10-24 追加）
+
+### 8.1 关键论文要点
+
+| 论文 | 核心结论 | 对本项目的启示 |
+|---|---|---|
+| **Beyond the GUI Paradigm**（arXiv 2606.19388，2026-06） | 不做任何移动端专门训练，直接用**通用编程 Agent**（Claude Code、mini-swe-agent、Terminus-2）通过 adb shell 操作 Android：Claude Code（Opus 4.7）在 AndroidWorld 上达到 71.8%、MobileWorld 上达到 51.9%，超过所有可复现的 GUI 专用模型（GUI-Owl-1.5-32B 分别为 69.3% / 43.2%）。在跨 App 任务上，GUI Agent 的成功率不超过 11%，CLI Agent 平均步数约为 GUI 的一半（10.7 vs 18.6）。 | ① **通用编程 Harness 可以直接迁移到手机场景**，关键在于系统提示词和工具层，而不是专门的模型。② 但它的优势依赖 **adb shell + 模拟器 root 权限可以直接读取 App 数据库**，这一点 **iOS 完全不具备**（见 8.3）。 |
+| **PhoneHarness**（arXiv 2606.14832） | 采用 GUI、CLI、宿主机工具混合的动作空间，按「确定性路径优先，GUI 兜底」的原则选择执行方式；按需加载 Skill；对敏感任务分为 SAFE_COMPLETE / CONFIRM_FIRST / NEVER_AUTO 三级。总成功率 75.0%，对比 AutoGLM-Phone 的 37.1%；纯 GUI 的单 App 长流程仍然是最主要的失败来源。 | 架构几乎就是我们「Mac 宿主机 + 手机」方案的 Android 版本，验证了**混合动作空间**和**分级审批**的设计。 |
+| **Mobile-Agent-v3 / GUI-Owl**（arXiv 2508.15144） | 多角色框架：Manager 负责规划，Worker 负责执行，Reflector 负责反思，Notetaker 负责记录。AndroidWorld 成绩 73.3%。 | **Notetaker（跨 App 的记事本）**正好对应 GUI Agent 在跨 App 任务上成功率不超过 11% 的短板 |
+| **AppAgentX**（arXiv 2503.02268） | 从执行历史中挖掘重复的动作序列，进化出高层「快捷动作」；第三方摘要称耗时和 token 最多可降低 47%（未核实原文）。 | 直接支持第 6 节的自进化 Skill 方案 |
+| **EvoSkill-GUI / KnowAct-GUIClaw**（2026） | 无需训练的 Skill 包进化；Skill / 快捷路径库 + deeplink 跳过导航 | 同上 |
+
+### 8.2 Mobile Harness 相比编程 / 电脑 Harness 的特殊性
+
+| # | 特殊性 | 编程 Harness（Claude Code / pi）的默认行为 | 手机场景需要的处理 |
+|---|---|---|---|
+| 1 | **观测以截图为主，token 很重** | 工具结果全部保留在上下文中 | 只保留最近 1–3 张截图，更早的替换为文字摘要；优先使用无障碍树或 OCR 文本（可以借助 context editing 的 `clear_tool_uses`） |
+| 2 | **动作是异步的** | 工具返回即表示完成 | 每次动作后要等待界面稳定（动画、加载完成），再做后置验证 |
+| 3 | **环境中断多** | 文件系统是确定的 | 弹窗、广告、权限请求、通知、登录失效都需要一个中断处理器，最好用规则处理，不消耗大模型 |
+| 4 | **坐标定位** | 不存在 | 截图像素和 iOS point 坐标之间的换算；优先使用元素 ID，其次用 Set-of-Marks 编号，最后才用坐标 |
+| 5 | **典型失败模式不同**（Beyond-GUI 的错误分析） | 编程 Agent 的典型失败是推理与动作不一致、验证不足 | GUI 的典型失败是**重复同一步骤**和**过早结束**，需要循环检测器和完成度验证器 |
+| 6 | **跨 App 状态** | 状态都在文件里 | 需要 Notetaker / 工作记忆，把 A App 里看到的信息结构化记录下来，供 B App 使用 |
+| 7 | **不可逆的真实副作用** | 权限按工具划分（bash、写文件） | 权限要按**语义动作**划分（付款、发消息、删除），采用三级审批（参考 PhoneHarness） |
+| 8 | **人工接管** | 很少需要 | 登录、验证码、Face ID 等环节必须交给用户，完成后 Agent 再接着执行 |
+| 9 | **延迟敏感** | 每一步都可以深度思考 | 常规步骤用低 effort 或小模型，重复任务走 Skill 快路径（第 6 节） |
+| 10 | **设备层故障** | 不存在 | WDA 崩溃需要自动重启，USB 断开要能重连，任务要能断点续跑 |
+
+### 8.3 iOS 相比 Android 论文结论的关键差异
+
+- **iOS 没有 shell，也没有办法读取 App 数据**：Beyond-GUI 和 PhoneHarness 的大部分收益来自 adb shell、读取数据库和 content provider，这些在 iPhone 上都不存在。**iOS 的 Agent 更依赖 GUI**，因此 Skill 快路径和 GUI 稳定性的工程价值反而更高。
+- **在 Mac 上构建「iOS 版 CLI 层」（差异化机会）**：
+  - **iCloud 同步数据**：通讯录、日历、提醒事项、备忘录、照片，可以在 Mac 上通过 EventKit / AppleScript / Photos 框架直接读写；短信和 iMessage 可以读取 Mac 上的 `chat.db`，也可以通过 Messages.app 发送。很多「查询、汇总、跨 App」类任务因此**不需要操作手机界面**。
+  - **快捷指令**：通过 WDA 打开 `shortcuts://run-shortcut?name=...` 来触发 iPhone 上的快捷指令，复用 App Intents 的能力。
+  - **URL Scheme / Universal Link**：直达 App 的深层页面。
+  - **设备管理**：`devicectl` 和 pymobiledevice3 可以完成 App 列表查询、启动 App、读取日志和设备信息，相当于 iOS 上的 `dumpsys`。
+- **推荐的路由顺序**：Mac 侧数据或快捷路径（确定性）→ Skill 回放 → 无障碍树驱动的 GUI 操作 → 视觉 GUI 操作。
+
+### 8.4 能否直接复用 Claude Code / Agent SDK / pi
+
+**结论：Harness 的骨架可以复用，而且论文已经证明这么做有效；移动端运行时层必须自己写。**
+
+| 选项 | 可复用的部分 | 不足 | 适用场景 |
+|---|---|---|---|
+| **Claude Code CLI 原样使用 + iPhone MCP** | 开箱即用，适合开发者用户 | 系统提示词面向编程；截图会持续累积在上下文中；权限审批按工具而不是按语义动作；不方便嵌入成产品 | 原型验证；「开发者工具」产品线（卖 MCP） |
+| **Claude Agent SDK** | 与 Claude Code 是同一套循环；可以自定义系统提示词；有 hooks（等待稳定、验证、审批）、Skills、子 Agent（Notetaker / Reflector / Skill 编译器）、会话管理 | 只能使用 Claude 模型；**Claude API 在中国大陆不可用**，面向国内的产品存在合规和可用性问题 | 海外市场的产品主路径 |
+| **pi（pi-mono）** | 核心极简（4 个工具 + 很短的系统提示词），提示词完全可控；用 TS 扩展机制添加手机工具和运行时；`pi-ai` 支持**多家模型**，可以接豆包 Seed、Qwen、GLM / AutoGLM 等国内模型，或「Claude 规划 + GUI 专用模型做视觉定位」的组合 | MCP、子 Agent、权限审批都需要靠扩展自己补；工程量比 Agent SDK 大 | **国内市场或需要多模型的场景**；希望完全掌控 Harness 的场景 |
+| 自研循环（Messages API 等） | 控制最细 | 工程量最大 | 规模化之后 |
+
+### 8.5 推荐架构（修正第 7 节）
+
+```
+┌ 规划层（复用）：Claude Agent SDK【海外】或 pi【国内 / 多模型】
+│   系统提示词：移动端四阶段循环（发现 → 检查 → 执行 → 验证），参考 Beyond-GUI 附录 A.1
+│   子 Agent：Notetaker（跨 App 记忆）、Reflector（失败反思）、Skill 编译器
+│
+├ 移动运行时层（自研，以 MCP Server 或 pi 扩展的形式提供）
+│   路由器：Mac 侧数据 / 快捷路径 → Skill 回放 → 无障碍树 GUI → 视觉 GUI
+│   截图上下文管理器（只保留最近 N 张，其余转为摘要）
+│   动作执行器（等待稳定 + 后置断言）、中断处理器（弹窗 / 广告 / 权限）
+│   循环检测与完成度验证、语义动作三级审批、人工接管
+│   Mac 侧 iOS 数据工具：EventKit / Contacts / Photos / chat.db / 快捷指令
+│
+└ 设备层：WDA（xcodebuild 保活）+ CoreMediaIO 实时画面 + 事件总线 → 可视化面板
+```
+
+### 8.6 补充参考
+
+- [Beyond the GUI Paradigm: Do Mobile Agents Need the Phone Screen? (arXiv 2606.19388)](https://arxiv.org/pdf/2606.19388)
+- [PhoneHarness: Mixed GUI, CLI, and Tool Actions (arXiv 2606.14832)](https://arxiv.org/html/2606.14832)
+- [Mobile-Agent-v3 / GUI-Owl (arXiv 2508.15144)](https://arxiv.org/abs/2508.15144)
+- [AppAgentX (arXiv 2503.02268)](https://arxiv.org/html/2503.02268v3)
+- [Dive into Claude Code: Design Space of AI Agent Systems (arXiv 2604.14228)](https://arxiv.org/html/2604.14228v3)
+- [ShawnPana/phone-harness](https://github.com/ShawnPana/phone-harness)
+- [Pi (pi.dev) 介绍](https://agentic-ai.readthedocs.io/en/latest/AgentHarness/pi-dev/)
+- [The irrational effectiveness of the Pi harness](https://rednafi.com/misc/pi-harness/)
+
+---
+
 ## 参考来源
 
 - [koprjaa/iphone-agent (GitHub)](https://github.com/koprjaa/iphone-agent)
