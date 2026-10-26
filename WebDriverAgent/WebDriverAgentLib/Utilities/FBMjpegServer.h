@@ -27,6 +27,14 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, weak, nullable) FBTCPSocket *socket;
 
 /**
+ When set, a client only starts receiving frames once its request carries this password, either
+ in an Authorization header (as FBHTTPServer accepts it) or, for <img> tags that cannot set
+ headers, as a "token" query parameter. Other clients get 401 and are disconnected. nil (the
+ default) streams to every client that connects.
+ */
+@property (nonatomic, copy, nullable) NSString *authPassword;
+
+/**
  Stops screenshot broadcasting and prevents future scheduling.
  */
 - (void)stopStreaming;

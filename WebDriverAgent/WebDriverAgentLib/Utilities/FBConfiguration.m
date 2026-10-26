@@ -136,10 +136,33 @@ static NSString *const axSettingsClassName = @"AXSettings";
 
 - (NSString *)bindingIPAddress
 {
+  // 'WebDriverAgent --bind-address 127.0.0.1' can be passed via the arguments to the process
+  NSString *addressFromArguments = [self.class valueFromArguments:NSProcessInfo.processInfo.arguments
+                                                           forKey:@"--bind-address"];
+  if (addressFromArguments.length > 0) {
+    return addressFromArguments;
+  }
+
   // Existence of USE_IP in the environment allows specifying which interface to bind to
   if (NSProcessInfo.processInfo.environment[@"USE_IP"] &&
       [NSProcessInfo.processInfo.environment[@"USE_IP"] length] > 0) {
     return NSProcessInfo.processInfo.environment[@"USE_IP"];
+  }
+
+  return nil;
+}
+
+- (NSString *)authPassword
+{
+  NSString *passwordFromArguments = [self.class valueFromArguments:NSProcessInfo.processInfo.arguments
+                                                            forKey:@"--auth-password"];
+  if (passwordFromArguments.length > 0) {
+    return passwordFromArguments;
+  }
+
+  NSString *passwordFromEnvironment = NSProcessInfo.processInfo.environment[@"WDA_AUTH_PASSWORD"];
+  if (passwordFromEnvironment.length > 0) {
+    return passwordFromEnvironment;
   }
 
   return nil;

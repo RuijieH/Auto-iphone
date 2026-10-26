@@ -14,6 +14,7 @@
 // Textual import, not `@import Network;` - see the comment in FBTCPSocket.h.
 #import <Network/Network.h>
 #import "FBConfiguration.h"
+#import "FBHTTPServer.h"
 #import "FBLogger.h"
 #import "FBScreenshot.h"
 #import "FBScreen.h"
@@ -28,6 +29,9 @@ static const NSTimeInterval FRAME_TIMEOUT = 1.;
 static const NSUInteger MAX_PENDING_FRAMES_PER_CLIENT = 4;
 static const NSTimeInterval FAILURE_BACKOFF_MIN = 1.0;
 static const NSTimeInterval FAILURE_BACKOFF_MAX = 10.0;
+// Caps a client's request head while it is being checked for credentials, so a connection that
+// never completes one cannot grow its buffer without limit. Matches FBHTTPServer's header cap.
+static const NSUInteger MAX_REQUEST_HEAD_SIZE = 16 * 1024;
 
 static NSString *const SERVER_NAME = @"WDA MJPEG Server";
 static const char *QUEUE_NAME = "JPEG Screenshots Provider Queue";
@@ -35,6 +39,38 @@ static const char *QUEUE_NAME = "JPEG Screenshots Provider Queue";
 static NSUInteger FBNormalizedMjpegFramerate(NSUInteger framerate)
 {
   return (0 == framerate || framerate > MAX_FPS) ? MAX_FPS : framerate;
+}
+
+// Whether a stream request's request line + headers carry `password`. An Authorization header,
+// when present, is the only credential considered.
+static BOOL FBMjpegRequestHeadIsAuthorized(NSString * _Nonnull requestHead, NSString * _Nonnull password)
+{
+  NSArray<NSString *> *lines = [requestHead componentsSeparatedByString:@"\r\n"];
+  for (NSUInteger i = 1; i < lines.count; i++) {
+    NSString *line = lines[i];
+    NSRange colonRange = [line rangeOfString:@":"];
+    if (NSNotFound == colonRange.location
+        || NSOrderedSame != [[line substringToIndex:colonRange.location] caseInsensitiveCompare:@"Authorization"]) {
+      continue;
+    }
+    NSString *value = [[line substringFromIndex:NSMaxRange(colonRange)]
+                       stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    return FBHTTPAuthorizationMatchesPassword(value, password);
+  }
+  // <img> tags cannot set headers, so the password is also accepted as a "token" query parameter.
+  // Unlike a header, it can end up in logs or browser history.
+  NSArray<NSString *> *requestLineParts = [lines.firstObject componentsSeparatedByString:@" "];
+  if (requestLineParts.count < 2) {
+    return NO;
+  }
+  NSURLComponents *requestTarget = [NSURLComponents componentsWithString:requestLineParts[1]];
+  for (NSURLQueryItem *queryItem in requestTarget.queryItems) {
+    if ([queryItem.name isEqualToString:@"token"] && nil != queryItem.value) {
+      NSString *bearer = [@"Bearer " stringByAppendingString:(NSString * _Nonnull)queryItem.value];
+      return FBHTTPAuthorizationMatchesPassword(bearer, password);
+    }
+  }
+  return NO;
 }
 
 
@@ -50,6 +86,10 @@ static NSUInteger FBNormalizedMjpegFramerate(NSUInteger framerate)
 @property (nonatomic, assign) NSUInteger droppedFramesCount;
 // Frames submitted but not sent yet, per client. Guarded by @synchronized (self.listeningClients).
 @property (nonatomic, readonly) NSMapTable<id, NSNumber *> *pendingFrameCounts;
+// Request bytes received so far from clients whose credentials are not checked yet, and clients
+// already turned away. Both guarded by @synchronized (self.listeningClients).
+@property (nonatomic, readonly) NSMapTable<id, NSMutableData *> *pendingRequestBuffers;
+@property (nonatomic, readonly) NSMutableSet *rejectedClients;
 
 @end
 
@@ -66,6 +106,9 @@ static NSUInteger FBNormalizedMjpegFramerate(NSUInteger framerate)
     _listeningClients = [NSMutableArray array];
     _pendingFrameCounts = [NSMapTable mapTableWithKeyOptions:(NSPointerFunctionsOptions)(NSMapTableObjectPointerPersonality | NSMapTableStrongMemory)
                                                 valueOptions:(NSPointerFunctionsOptions)NSMapTableStrongMemory];
+    _pendingRequestBuffers = [NSMapTable mapTableWithKeyOptions:(NSPointerFunctionsOptions)(NSMapTableObjectPointerPersonality | NSMapTableStrongMemory)
+                                                   valueOptions:(NSPointerFunctionsOptions)NSMapTableStrongMemory];
+    _rejectedClients = [NSMutableSet set];
     _imageProcessor = [[FBImageProcessor alloc] init];
     dispatch_queue_attr_t queueAttributes = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
     _backgroundQueue = dispatch_queue_create(QUEUE_NAME, queueAttributes);
@@ -202,7 +245,38 @@ static NSUInteger FBNormalizedMjpegFramerate(NSUInteger framerate)
 - (void)client:(nw_connection_t)client didReceiveData:(NSData *)data
 {
   @synchronized (self.listeningClients) {
-    if ([self.listeningClients containsObject:client]) {
+    if ([self.listeningClients containsObject:client] || [self.rejectedClients containsObject:client]) {
+      return;
+    }
+  }
+
+  NSString *password = self.authPassword;
+  if (password.length > 0) {
+    NSString *requestHead = nil;
+    BOOL isOverHeadCap = NO;
+    @synchronized (self.listeningClients) {
+      NSMutableData *buffer = [self.pendingRequestBuffers objectForKey:client];
+      if (nil == buffer) {
+        buffer = [NSMutableData data];
+        [self.pendingRequestBuffers setObject:buffer forKey:client];
+      }
+      [buffer appendData:data];
+      NSData *headTerminator = (NSData * _Nonnull)[@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
+      NSRange headEnd = [buffer rangeOfData:headTerminator options:(NSDataSearchOptions)0 range:NSMakeRange(0, buffer.length)];
+      if (NSNotFound != headEnd.location) {
+        NSData *headData = [buffer subdataWithRange:NSMakeRange(0, headEnd.location)];
+        requestHead = [[NSString alloc] initWithData:headData encoding:NSUTF8StringEncoding] ?: @"";
+        [self.pendingRequestBuffers removeObjectForKey:client];
+      } else {
+        isOverHeadCap = buffer.length > MAX_REQUEST_HEAD_SIZE;
+      }
+    }
+    if (nil == requestHead && !isOverHeadCap) {
+      // Wait for the rest of the request head.
+      return;
+    }
+    if (nil == requestHead || !FBMjpegRequestHeadIsAuthorized(requestHead, (NSString * _Nonnull)password)) {
+      [self rejectUnauthorizedClient:client];
       return;
     }
   }
@@ -215,11 +289,26 @@ static NSUInteger FBNormalizedMjpegFramerate(NSUInteger framerate)
   }
 }
 
+- (void)rejectUnauthorizedClient:(nw_connection_t)client
+{
+  [FBLogger log:@"Rejected a screenshots broadcast client without valid credentials"];
+  @synchronized (self.listeningClients) {
+    [self.pendingRequestBuffers removeObjectForKey:client];
+    [self.rejectedClients addObject:client];
+  }
+  NSString *response = [NSString stringWithFormat:@"HTTP/1.0 401 Unauthorized\r\nServer: %@\r\nWWW-Authenticate: Basic realm=\"WebDriverAgent\", charset=\"UTF-8\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", SERVER_NAME];
+  [self.socket writeData:(id)[response dataUsingEncoding:NSUTF8StringEncoding] toClient:client completion:^(BOOL didSucceed) {
+    nw_connection_cancel(client);
+  }];
+}
+
 - (void)didClientDisconnect:(nw_connection_t)client
 {
   @synchronized (self.listeningClients) {
     [self.listeningClients removeObject:client];
     [self.pendingFrameCounts removeObjectForKey:client];
+    [self.pendingRequestBuffers removeObjectForKey:client];
+    [self.rejectedClients removeObject:client];
   }
   // Nothing is owed to a client that stopped listening, so its socket can go right away.
   nw_connection_cancel(client);
@@ -233,6 +322,8 @@ static NSUInteger FBNormalizedMjpegFramerate(NSUInteger framerate)
     NSArray<nw_connection_t> *clients = self.listeningClients.copy;
     [self.listeningClients removeAllObjects];
     [self.pendingFrameCounts removeAllObjects];
+    [self.pendingRequestBuffers removeAllObjects];
+    [self.rejectedClients removeAllObjects];
     for (nw_connection_t client in clients) {
       nw_connection_cancel(client);
     }

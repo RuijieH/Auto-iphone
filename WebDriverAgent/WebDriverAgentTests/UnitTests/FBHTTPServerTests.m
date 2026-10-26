@@ -455,4 +455,84 @@ static NSString *FBCompleteResponse(NSData *data)
   XCTAssertTrue(didClose, @"the connection must be closed rather than left buffering");
 }
 
+- (NSString *)responseForRequest:(NSString *)request didClose:(BOOL *)didClose
+{
+  return [self responseForRawPayload:(NSData * _Nonnull)[request dataUsingEncoding:NSUTF8StringEncoding]
+                              timeout:5.0
+                             didClose:didClose];
+}
+
+- (void)testRequestWithoutCredentialsIsRejectedWhenPasswordIsSet
+{
+  self.server.authPassword = @"s3cret";
+  BOOL didClose;
+  NSString *response = [self responseForRequest:@"GET /framing/ping HTTP/1.1\r\n\r\n" didClose:&didClose];
+  XCTAssertTrue([response hasPrefix:@"HTTP/1.1 401"], @"%@", response);
+  XCTAssertTrue([response containsString:@"WWW-Authenticate: Basic realm=\"WebDriverAgent\""], @"%@", response);
+  XCTAssertFalse([response containsString:@"pong"], @"%@", response);
+  XCTAssertTrue(didClose, @"the connection must be closed after a rejected request");
+}
+
+- (void)testRequestWithWrongPasswordIsRejected
+{
+  self.server.authPassword = @"s3cret";
+  BOOL didClose;
+  NSString *bearer = [self responseForRequest:@"GET /framing/ping HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n" didClose:&didClose];
+  XCTAssertTrue([bearer hasPrefix:@"HTTP/1.1 401"], @"%@", bearer);
+  // "any:wrong"
+  NSString *basic = [self responseForRequest:@"GET /framing/ping HTTP/1.1\r\nAuthorization: Basic YW55Ondyb25n\r\n\r\n" didClose:&didClose];
+  XCTAssertTrue([basic hasPrefix:@"HTTP/1.1 401"], @"%@", basic);
+}
+
+- (void)testBearerCredentialsAreAccepted
+{
+  self.server.authPassword = @"s3cret";
+  BOOL didClose;
+  NSString *response = [self responseForRequest:@"GET /framing/ping HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n\r\n" didClose:&didClose];
+  XCTAssertTrue([response hasPrefix:@"HTTP/1.1 200"], @"%@", response);
+  XCTAssertTrue([response containsString:@"pong"], @"%@", response);
+}
+
+- (void)testBasicCredentialsAreAccepted
+{
+  self.server.authPassword = @"s3cret";
+  BOOL didClose;
+  // "any:s3cret"
+  NSString *response = [self responseForRequest:@"GET /framing/ping HTTP/1.1\r\nauthorization: basic YW55OnMzY3JldA==\r\n\r\n" didClose:&didClose];
+  XCTAssertTrue([response hasPrefix:@"HTTP/1.1 200"], @"%@", response);
+  XCTAssertTrue([response containsString:@"pong"], @"%@", response);
+}
+
+- (void)testRejectedRequestIsNeverDispatched
+{
+  self.server.authPassword = @"s3cret";
+  BOOL didClose;
+  NSString *response = [self responseForRequest:@"POST /framing/probe HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}" didClose:&didClose];
+  XCTAssertTrue([response hasPrefix:@"HTTP/1.1 401"], @"%@", response);
+  XCTAssertEqual(atomic_load(&gFramingProbeHits), 0, @"an unauthenticated request must not reach its route");
+}
+
+- (void)testPreflightNeedsNoCredentials
+{
+  self.server.authPassword = @"s3cret";
+  BOOL didClose;
+  NSString *response = [self responseForRequest:@"OPTIONS /framing/ping HTTP/1.1\r\n\r\n" didClose:&didClose];
+  XCTAssertFalse([response hasPrefix:@"HTTP/1.1 401"], @"%@", response);
+}
+
+- (void)testAuthorizationMatching
+{
+  XCTAssertTrue(FBHTTPAuthorizationMatchesPassword(@"Bearer s3cret", @"s3cret"));
+  XCTAssertTrue(FBHTTPAuthorizationMatchesPassword(@"BEARER   s3cret ", @"s3cret"));
+  XCTAssertTrue(FBHTTPAuthorizationMatchesPassword(@"Basic YW55OnMzY3JldA==", @"s3cret"));
+  XCTAssertFalse(FBHTTPAuthorizationMatchesPassword(nil, @"s3cret"));
+  XCTAssertFalse(FBHTTPAuthorizationMatchesPassword(@"", @"s3cret"));
+  XCTAssertFalse(FBHTTPAuthorizationMatchesPassword(@"s3cret", @"s3cret"));
+  XCTAssertFalse(FBHTTPAuthorizationMatchesPassword(@"Bearer s3cre", @"s3cret"));
+  XCTAssertFalse(FBHTTPAuthorizationMatchesPassword(@"Token s3cret", @"s3cret"));
+  XCTAssertFalse(FBHTTPAuthorizationMatchesPassword(@"Basic not-base64!", @"s3cret"));
+  // "nocolon"
+  XCTAssertFalse(FBHTTPAuthorizationMatchesPassword(@"Basic bm9jb2xvbg==", @"s3cret"));
+}
+
 @end

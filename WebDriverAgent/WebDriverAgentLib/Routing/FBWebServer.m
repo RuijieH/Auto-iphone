@@ -80,7 +80,8 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
   [self.server setRouteQueue:dispatch_get_main_queue()];
   [self.server setDefaultHeader:@"Server" value:@"WebDriverAgent/1.0"];
   [self.server setDefaultHeader:@"Access-Control-Allow-Origin" value:@"*"];
-  [self.server setDefaultHeader:@"Access-Control-Allow-Headers" value:@"Content-Type, X-Requested-With"];
+  [self.server setDefaultHeader:@"Access-Control-Allow-Headers" value:@"Content-Type, X-Requested-With, Authorization"];
+  self.server.authPassword = FBConfiguration.sharedInstance.authPassword;
 
   [NSNotificationCenter.defaultCenter addObserver:self
                                           selector:@selector(sessionWasKilled:)
@@ -122,6 +123,12 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
     abort();
   }
 
+  if (nil != self.server.authPassword) {
+    [FBLogger log:@"Password authentication is enabled for the HTTP and MJPEG servers"];
+  } else if (nil == bindingIP) {
+    [FBLogger log:@"WARNING: listening on all interfaces without authentication - anyone on the network can control this device. Set WDA_AUTH_PASSWORD and/or USE_IP"];
+  }
+
   NSString *serverHost = bindingIP ?: ([XCUIDevice sharedDevice].fb_wifiIPAddress ?: @"127.0.0.1");
   [FBLogger logFmt:@"%@http://%@:%d%@", FBServerURLBeginMarker, serverHost, [self.server port], FBServerURLEndMarker];
   return YES;
@@ -131,6 +138,7 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 {
   [self readMjpegSettingsFromEnv];
   self.mjpegServer = [[FBMjpegServer alloc] init];
+  self.mjpegServer.authPassword = FBConfiguration.sharedInstance.authPassword;
   self.screenshotsBroadcaster = [[FBTCPSocket alloc]
                                  initWithPort:(uint16_t)FBConfiguration.sharedInstance.mjpegServerPort];
   // Bind to the same address as the HTTP server when USE_IP is set.

@@ -20,7 +20,21 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/**
+ Whether an Authorization header value carries `password`, either as "Bearer <password>" or as
+ "Basic base64(<any user>:<password>)". The comparison takes the same time whatever the input.
+ */
+FOUNDATION_EXTERN BOOL FBHTTPAuthorizationMatchesPassword(NSString * _Nullable authorization, NSString *password);
+
 @interface FBHTTPServer : NSObject
+
+/**
+ When set, every request except CORS preflights (OPTIONS) must carry this password in its
+ Authorization header (see FBHTTPAuthorizationMatchesPassword). Anything else is answered with
+ 401 and its connection is closed before the request body is read. nil (the default) disables
+ authentication.
+ */
+@property (nonatomic, copy, nullable) NSString *authPassword;
 
 /*! The port the server is (or will be) listening on */
 @property (nonatomic) uint16_t port;

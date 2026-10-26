@@ -21,6 +21,7 @@
   [super setUp];
   unsetenv("USE_PORT");
   unsetenv("USE_IP");
+  unsetenv("WDA_AUTH_PASSWORD");
   unsetenv("VERBOSE_LOGGING");
   unsetenv("MAX_HTTP_REQUEST_BODY_SIZE");
 }
@@ -56,6 +57,23 @@
 {
   setenv("USE_IP", "192.168.1.100", 1);
   XCTAssertEqualObjects(FBConfiguration.sharedInstance.bindingIPAddress, @"192.168.1.100");
+}
+
+- (void)testAuthPasswordDefault
+{
+  XCTAssertNil(FBConfiguration.sharedInstance.authPassword);
+}
+
+- (void)testAuthPasswordEnvironmentOverwrite
+{
+  setenv("WDA_AUTH_PASSWORD", "s3cret", 1);
+  XCTAssertEqualObjects(FBConfiguration.sharedInstance.authPassword, @"s3cret");
+}
+
+- (void)testEmptyAuthPasswordDisablesAuthentication
+{
+  setenv("WDA_AUTH_PASSWORD", "", 1);
+  XCTAssertNil(FBConfiguration.sharedInstance.authPassword);
 }
 
 - (void)testHttpRequestBodySizeLimitDefault

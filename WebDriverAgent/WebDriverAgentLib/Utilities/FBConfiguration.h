@@ -124,9 +124,19 @@ typedef NS_ENUM(NSInteger, FBConfigurationKeyboardPreference) {
 
 /**
  The IP address that the HTTP Server should bind to on launch.
- Returns nil if not specified, which causes the server to listen on all interfaces.
+ Can be set with the '--bind-address' process argument or the USE_IP environment variable
+ (the argument wins). Returns nil if not specified, which causes the server to listen on all
+ interfaces.
  */
 @property (atomic, readonly, nullable) NSString *bindingIPAddress;
+
+/**
+ The password that clients of the HTTP and MJPEG servers must present.
+ Can be set with the '--auth-password' process argument or the WDA_AUTH_PASSWORD environment
+ variable (the argument wins). Returns nil if not specified, which leaves both servers
+ unauthenticated.
+ */
+@property (atomic, readonly, nullable) NSString *authPassword;
 
 /**
  The port number where the background screenshots broadcaster is supposed to run

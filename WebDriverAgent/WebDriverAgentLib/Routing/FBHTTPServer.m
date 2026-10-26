@@ -8,6 +8,8 @@
 
 #import "FBHTTPServer.h"
 
+#import <CommonCrypto/CommonDigest.h>
+
 #import "FBCommandStatus.h"
 #import "FBConfiguration.h"
 #import "FBLogger.h"
@@ -59,6 +61,48 @@ static BOOL FBParseContentLength(NSString *value, NSUInteger *outLength)
   }
   *outLength = result;
   return YES;
+}
+
+// Compares digests rather than the strings themselves, so the time taken depends on neither
+// input's length nor on how long a prefix of the password a guess gets right.
+static BOOL FBConstantTimeEqual(NSString * _Nonnull candidate, NSString * _Nonnull expected)
+{
+  NSData *candidateData = FBUTF8Data(candidate);
+  NSData *expectedData = FBUTF8Data(expected);
+  unsigned char candidateDigest[CC_SHA256_DIGEST_LENGTH];
+  unsigned char expectedDigest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256(candidateData.bytes, (CC_LONG)candidateData.length, candidateDigest);
+  CC_SHA256(expectedData.bytes, (CC_LONG)expectedData.length, expectedDigest);
+  unsigned char difference = 0;
+  for (size_t i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+    difference = (unsigned char)(difference | (candidateDigest[i] ^ expectedDigest[i]));
+  }
+  return 0 == difference;
+}
+
+BOOL FBHTTPAuthorizationMatchesPassword(NSString * _Nullable authorization, NSString * _Nonnull password)
+{
+  NSRange schemeEnd = [authorization rangeOfString:@" "];
+  if (nil == authorization || NSNotFound == schemeEnd.location) {
+    return NO;
+  }
+  NSString *scheme = [authorization substringToIndex:schemeEnd.location];
+  NSString *credentials = [[authorization substringFromIndex:NSMaxRange(schemeEnd)]
+                           stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+  if (NSOrderedSame == [scheme caseInsensitiveCompare:@"Bearer"]) {
+    return FBConstantTimeEqual(credentials, password);
+  }
+  if (NSOrderedSame != [scheme caseInsensitiveCompare:@"Basic"]) {
+    return NO;
+  }
+  NSData *decoded = [[NSData alloc] initWithBase64EncodedString:credentials options:(NSDataBase64DecodingOptions)0];
+  NSString *userAndPassword = nil == decoded ? nil : [[NSString alloc] initWithData:decoded encoding:NSUTF8StringEncoding];
+  NSRange userEnd = [userAndPassword rangeOfString:@":"];
+  if (nil == userAndPassword || NSNotFound == userEnd.location) {
+    return NO;
+  }
+  // The user name is ignored: the password alone is the shared secret.
+  return FBConstantTimeEqual([userAndPassword substringFromIndex:NSMaxRange(userEnd)], password);
 }
 
 @interface FBHTTPRoute : NSObject
@@ -570,6 +614,11 @@ static const int64_t FBStaleConnectionSweepIntervalSec = 10;
   if (nil == requestHeaders) {
     return nil;
   }
+  // Checked before the body is framed, so an unauthenticated client never gets its body buffered.
+  if (![self isRequestAuthorizedWithMethod:requestLineParts[0] headerFields:requestHeaders]) {
+    [self respondUnauthorizedToClient:client];
+    return nil;
+  }
   NSUInteger contentLength = 0;
   if (![self resolveBodyLength:&contentLength fromHeaderFields:requestHeaders forClient:client]) {
     return nil;
@@ -643,6 +692,32 @@ static const int64_t FBStaleConnectionSweepIntervalSec = 10;
                                                                                                 traceback:nil]);
   [payload dispatchWithResponse:badRequest];
   [self failClient:client withResponse:badRequest];
+}
+
+- (BOOL)isRequestAuthorizedWithMethod:(NSString *)method
+                         headerFields:(NSDictionary<NSString *, NSString *> *)requestHeaders
+{
+  NSString *password = self.authPassword;
+  if (0 == password.length) {
+    return YES;
+  }
+  // Browsers never attach credentials to CORS preflights, so requiring them there would block
+  // every authenticated cross-origin request. The preflight route itself only answers a ping.
+  if (NSOrderedSame == [method caseInsensitiveCompare:@"OPTIONS"]) {
+    return YES;
+  }
+  return FBHTTPAuthorizationMatchesPassword(requestHeaders[@"authorization"], (NSString * _Nonnull)password);
+}
+
+- (void)respondUnauthorizedToClient:(nw_connection_t)client
+{
+  [FBLogger log:@"Rejected a request without valid credentials"];
+  RouteResponse *unauthorized = [RouteResponse new];
+  unauthorized.statusCode = kHTTPStatusCodeUnauthorized;
+  [unauthorized setHeader:@"WWW-Authenticate" value:@"Basic realm=\"WebDriverAgent\", charset=\"UTF-8\""];
+  [unauthorized setHeader:@"Content-Type" value:@"application/json;charset=UTF-8"];
+  [unauthorized respondWithString:@"{\"value\":{\"error\":\"unauthorized\",\"message\":\"Valid credentials are required to access WebDriverAgent\",\"stacktrace\":\"\"}}"];
+  [self failClient:client withResponse:unauthorized];
 }
 
 - (void)applyDefaultHeadersToResponse:(RouteResponse *)response
@@ -936,6 +1011,8 @@ static const int64_t FBStaleConnectionSweepIntervalSec = 10;
     return @"OK";
   } else if (kHTTPStatusCodeBadRequest == statusCode) {
     return @"Bad Request";
+  } else if (kHTTPStatusCodeUnauthorized == statusCode) {
+    return @"Unauthorized";
   } else if (kHTTPStatusCodeNotFound == statusCode) {
     return @"Not Found";
   } else if (kHTTPStatusCodeMethodNotAllowed == statusCode) {
