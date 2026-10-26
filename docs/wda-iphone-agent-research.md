@@ -459,6 +459,65 @@ Skill 的生命周期：大模型首次完成任务 → 生成候选 Skill → �
 
 ---
 
+## 11. 把 Agent Harness 写进 WDA 是否可行（2026-10-26 追加）
+
+**结论：技术上能跑通，但投入产出比低，不建议把整个 Harness 放进 WDA。** 推荐的折中方案是把**移动运行时层中对延迟敏感的部分**下沉到 WDA，作为自定义接口；LLM 循环仍然留在 Mac 上。
+
+### 11.1 能做到的部分
+
+- **进程不会被挂起**：XCTest Runner 在测试会话期间一直运行，可以持续驱动任意前台 App，避开了普通 App 切到后台就被挂起的问题（第 2.2 节架构 C）。
+- **可以联网**：Runner 进程里可以用 URLSession 调用云端 LLM API。
+- **进程内操作更快**：截图、无障碍快照、元素查询都直接调用 XCUITest，省去 HTTP 和 USB 这一跳，每步约节省几十到两百毫秒（推断）。
+- **WDA 本身支持扩展**：可以在 fork 中通过 `FBCommandHandler` 注册自定义路由（这是社区常见的做法）。
+
+### 11.2 关键障碍
+
+| 障碍 | 影响 |
+|---|---|
+| **生命周期仍然依赖宿主机** | Runner 必须由 Mac 通过 testmanagerd（`xcodebuild` / `devicectl` / go-ios）拉起；有人实测发现每次启动都需要 Mac 处于唤醒状态、需要人工执行命令，从启动到服务可用约 90 秒；iOS 17+ 还有宿主机断开后 WDA 跟着退出的报告。**「脱离 Mac 自主运行」这个最大的潜在收益实际上拿不到** |
+| **无法复用现成的 Harness** | iOS 上不能运行 Node，pi、Claude Agent SDK、OpenCode 都无法使用；只能**用 Swift 重写**循环、工具调用、上下文管理、Skill 加载、子 Agent 等全部逻辑，与第 10 节的「套壳」路线冲突 |
+| **私有 API 不断被移除** | iOS 27 移除了 WDA 依赖的私有方法（`FBTestmanagerdVersion`、等待界面稳定的 `fb_waitUntilStableWithTimeout:`），需要打补丁才能继续运行。Harness 和 WDA 绑得越深，每次 iOS 升级的维护成本越高 |
+| **延迟收益有限** | 单步耗时的大头是 LLM 推理（1–5 秒），进程内节省的几十到两百毫秒只是零头 |
+| **开发和调试效率低** | 每改一次都要重新编译、签名、安装 Runner，无法像 Mac 上的 Node 那样热更新；日志和可视化都要额外回传 |
+| **会丢掉 Mac 侧的能力** | 第 8.3 节的 iCloud 数据、`chat.db`、EventKit 等「iOS 版 CLI」工具都在 Mac 上，Harness 放到手机上后需要反向调用 Mac |
+| **交互和安全** | Runner 本身没有可用的界面，用户输入要靠配套 App 或 Mac；API Key 存放在手机上；WDA 端口依然没有鉴权，需要自己加 |
+| **会话期间手机被占用** | 自动化运行时屏幕被接管，手机无法正常使用，建议使用专用设备 |
+| **其他约束** | 锁屏后 UI 操作会失败，需要保持屏幕常亮（待验证）；Runner 有内存上限；签名证书会过期（免费账号 7 天，付费账号 1 年） |
+
+### 11.3 推荐的折中方案：WDA 只做「快执行层」
+
+```
+Mac：LLM 循环（pi / Agent SDK）+ Skill 库 + Mac 侧数据工具 + 可视化面板
+   │  一次 LLM 决策 → 一个高层调用
+   ▼  （USB 转发，带 token 鉴权）
+WDA fork 中的自定义接口（Swift，进程内执行）：
+   /agent/observe       压缩后的无障碍树 + OCR 文本 + 可选截图（一次返回）
+   /agent/act           执行动作 → 等待界面稳定 → 后置断言 → 返回界面变化摘要
+   /agent/macro         执行宏工具（多步 + 逐步断言），失败时返回失败点
+   /agent/interrupts    规则化处理弹窗、权限请求、广告
+```
+
+- **收益**：一次 HTTP 往返完成「动作 + 等待 + 验证 + 观测」，减少 LLM 轮次和网络往返；宏工具在手机端以最低延迟执行。
+- **Mac 侧的 Harness 保持不变**：可以继续套壳 pi 或 Agent SDK，界面魔改不受影响。
+- **控制 WDA fork 的范围**：只做加法，即新增路由，**不改动核心代码**，以降低每次 iOS 升级时的合并成本。
+
+### 11.4 如果仍然想验证「Harness 全部放在手机上」，需要先实测的问题
+
+- [ ] 用 `devicectl` 或 `xcodebuild` 拉起后拔掉 USB，Wi-Fi 配对的 Mac 合盖或睡眠时，Runner 能存活多久（iOS 26 / 27 分别测）。
+- [ ] 锁屏、来电、低电量模式下 Runner 的表现。
+- [ ] Runner 进程内调用 Foundation Models（端侧模型）是否可行。
+- [ ] Runner 连续运行 8 小时的内存和稳定性。
+
+### 11.5 补充参考
+
+- [My AI Agent Drove My iPhone for a Day. Then I Parked It.（DEV，iOS 27 实测）](https://dev.to/honeykiran/my-ai-agent-drove-my-iphone-for-a-day-then-i-parked-it-5901)
+- [appium-xcuitest-driver issue #2978（iOS 26 / 18 上 WDA 约 20 秒后退出）](https://github.com/appium/appium-xcuitest-driver/issues/2978)
+- [go-ios issue #391（runwda 与 testmanagerd）](https://github.com/danielpaulus/go-ios/issues/391)
+- [mobilecli issue #487（Wi-Fi 真机 Runner）](https://github.com/mobile-next/mobilecli/issues/487)
+- [WebDriverAgent - The Heart of iOS E2E Testing](https://trinhngocthuyen.com/posts/tech/mobile-e2e-wda/)
+
+---
+
 ## 参考来源
 
 - [koprjaa/iphone-agent (GitHub)](https://github.com/koprjaa/iphone-agent)
